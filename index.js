@@ -39,7 +39,7 @@ app.post('/api/auth/login', async (req, res) => {
     // 1. Decrypt and verify the Google Token
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
-      audience: GOOGLE_CLIENT_ID,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
     
     const payload = ticket.getPayload();
