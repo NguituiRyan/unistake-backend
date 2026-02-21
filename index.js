@@ -403,6 +403,36 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
+// --- 11. DEMO WITHDRAW FUNDS ---
+app.post('/api/withdraw', async (req, res) => {
+  const { email, amount } = req.body;
+  try {
+    const withdrawAmount = parseFloat(amount);
+    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid withdrawal amount' });
+    }
+
+    // 1. Check if they have enough money
+    const userRes = await pool.query('SELECT balance_kes FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    
+    const currentBalance = parseFloat(userRes.rows[0].balance_kes);
+    if (currentBalance < withdrawAmount) {
+      return res.status(400).json({ error: 'Insufficient funds for withdrawal' });
+    }
+
+    // 2. Deduct the money from their balance
+    const updatedUser = await pool.query(
+      'UPDATE users SET balance_kes = balance_kes - $1 WHERE email = $2 RETURNING *',
+      [withdrawAmount, email]
+    );
+
+    res.json({ message: 'Withdrawal successful', user: updatedUser.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(port, () => {
   console.log(`🚀 UniStake Engine running at http://localhost:${port}`);
 });
