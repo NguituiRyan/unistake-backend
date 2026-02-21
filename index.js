@@ -179,20 +179,58 @@ app.post('/api/bet', async (req, res) => {
   }
 });
 
-// --- 7. GET A USER'S BET HISTORY ---
+// --- 7. GET A USER'S BET HISTORY (WITH ACTUAL PAYOUT MATH) ---
 app.get('/api/bets', async (req, res) => {
   const { email } = req.query;
   try {
     const result = await pool.query(`
       SELECT b.id, b.chosen_option, b.amount_kes, b.placed_at,
-             m.title, m.is_resolved, m.winning_option, m.option_a, m.option_b
+             m.title, m.is_resolved, m.winning_option, m.option_a, m.option_b, 
+             m.option_a_pool, m.option_b_pool
       FROM bets b
       JOIN users u ON b.user_id = u.id
       JOIN markets m ON b.market_id = m.id
       WHERE u.email = $1
       ORDER BY b.placed_at DESC
     `, [email]);
-    res.json(result.rows);
+
+    // Calculate exact payouts for resolved markets!
+    const betsWithPayouts = result.rows.map(bet => {
+      const stake = parseFloat(bet.amount_kes);
+      let totalPayout = 0;
+      let status = 'Pending';
+
+      if (bet.is_resolved) {
+        if (bet.winning_option === 'Refunded') {
+          status = 'Refunded';
+          totalPayout = stake; // Got exactly their money back
+        } else if (bet.chosen_option === bet.winning_option) {
+          status = 'Won';
+          const poolA = parseFloat(bet.option_a_pool || 0);
+          const poolB = parseFloat(bet.option_b_pool || 0);
+          const totalPool = poolA + poolB;
+          const winningPool = bet.winning_option === 'A' ? poolA : poolB;
+          const losingPool = bet.winning_option === 'A' ? poolB : poolA;
+
+          const fee = totalPool < 1000 ? 0 : 0.05;
+          const distributableProfit = losingPool - (losingPool * fee);
+          const share = stake / winningPool;
+
+          totalPayout = stake + (share * distributableProfit);
+        } else {
+          status = 'Lost';
+          totalPayout = 0;
+        }
+      }
+
+      return {
+        ...bet,
+        status, // 'Pending', 'Won', 'Lost', or 'Refunded'
+        payout_kes: totalPayout // Their exact winnings!
+      };
+    });
+
+    res.json(betsWithPayouts);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -354,7 +392,8 @@ app.get('/api/leaderboard', async (req, res) => {
         phoneNumber: row.phone_number,
         balance: parseFloat(row.balance),
         totalBets: parseInt(row.total_bets),
-        winRate: winRate
+        winRate: winRate,
+        wonBets: won,
       };
     });
 
