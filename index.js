@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { OAuth2Client } = require('google-auth-library');
+const bcrypt = require('bcrypt');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -72,6 +73,72 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) {
     console.error("Auth Error:", err);
     res.status(401).json({ error: 'Invalid Google Security Token' });
+  }
+});
+
+// --- 1.5. SECURE EMAIL/PASSWORD AUTH ---
+
+// Route A: Register a new user
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password } = req.body;
+  const cleanEmail = email.toLowerCase().trim();
+
+  try {
+    // 1. Check if user already exists
+    const existing = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Email is already registered. Please log in.' });
+    }
+
+    // 2. Hash the password (Salt rounds: 10)
+    const hash = await bcrypt.hash(password, 10);
+
+    // 3. Insert into database
+    await pool.query(
+      'INSERT INTO users (email, password_hash) VALUES ($1, $2)', 
+      [cleanEmail, hash]
+    );
+
+    // 4. Send them to onboarding!
+    res.json({ isNewUser: true, email: cleanEmail });
+  } catch (err) {
+    console.error("Register Error:", err);
+    res.status(500).json({ error: 'Server error during registration' });
+  }
+});
+
+// Route B: Login an existing user
+app.post('/api/auth/login-email', async (req, res) => {
+  const { email, password } = req.body;
+  const cleanEmail = email.toLowerCase().trim();
+
+  try {
+    // 1. Find the user
+    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [cleanEmail]);
+    if (userRes.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    const user = userRes.rows[0];
+
+    // 2. If they signed up with Google originally, they won't have a password hash!
+    if (!user.password_hash) {
+      return res.status(401).json({ error: 'This account was created with Google. Please use Google Sign-In.' });
+    }
+
+    // 3. Check if password matches the hash
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    // 4. Check if they finished onboarding (Do they have a nickname?)
+    const isNewUser = user.nickname == null;
+    
+    res.json({ isNewUser, user, email: cleanEmail });
+  } catch (err) {
+    console.error("Login Error:", err);
+    res.status(500).json({ error: 'Server error during login' });
   }
 });
 
