@@ -336,7 +336,7 @@ app.get('/api/leaderboard', async (req, res) => {
       LEFT JOIN markets m ON b.market_id = m.id
       WHERE u.nickname IS NOT NULL AND u.nickname != '' 
       GROUP BY u.id
-      ORDER BY u.balance_kes DESC
+      ORDER BY won_bets DESC, u.balance_kes DESC
       LIMIT 100;
     `;
     const result = await pool.query(query);
