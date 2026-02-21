@@ -1,4 +1,4 @@
-require('dotenv').config(); //  This loads .env file
+require('dotenv').config(); 
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -11,32 +11,48 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Initialize Google Bouncer using the hidden .env variable
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // --- CLOUD DATABASE CONNECTION (Neon) ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false // <-- CRITICAL: Required for connecting to secure cloud databases like Neon!
+    rejectUnauthorized: false 
   }
 });
 
-// Test the connection to the cloud
-pool.connect((err, client, release) => {
+// Test the connection to the cloud & Initialize New Tables!
+pool.connect(async (err, client, release) => {
   if (err) {
     return console.error('Error acquiring cloud client', err.stack);
   }
   console.log('✅ Successfully connected to Neon Cloud Database!');
+  
+  // NEW: Auto-create the theses table for Phase 1 if it doesn't exist
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS theses (
+        id SERIAL PRIMARY KEY,
+        bet_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        market_id INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('✅ Theses table is ready!');
+  } catch (tableErr) {
+    console.error('Error creating theses table:', tableErr);
+  }
+  
   release();
 });
 
 // --- 1. SECURE GOOGLE AUTH / LOGIN ---
 app.post('/api/auth/login', async (req, res) => {
-  const { credential } = req.body; // We now receive a secure token, not just text!
+  const { credential } = req.body; 
 
   try {
-    // 1. Decrypt and verify the Google Token
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
       audience: process.env.GOOGLE_CLIENT_ID,
@@ -45,19 +61,12 @@ app.post('/api/auth/login', async (req, res) => {
     const payload = ticket.getPayload();
     const email = payload.email.toLowerCase();
 
-    // 2. THE STRATHMORE BOUNCER
-    if (!email.endsWith('@strathmore.edu')) {
-      return res.status(403).json({ error: 'Access Denied. Only @strathmore.edu emails are allowed.' });
-    }
-
-    // 3. Check if user exists in the database
+    // UPDATE: Removed @strathmore.edu restriction! Any valid email works.
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     
     if (result.rows.length > 0) {
-      // Returning user
       res.json({ isNewUser: false, user: result.rows[0], email: email });
     } else {
-      // Brand new user (send them to Onboarding!)
       res.json({ isNewUser: true, email: email });
     }
   } catch (err) {
@@ -94,7 +103,7 @@ app.get('/api/balance/:email', async (req, res) => {
   }
 });
 
-// --- 4. MARKETS (Strictly counts UNIQUE human traders) ---
+// --- 4. MARKETS ---
 app.get('/api/markets', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -106,8 +115,6 @@ app.get('/api/markets', async (req, res) => {
       GROUP BY m.id
       ORDER BY m.id DESC
     `);
-    
-    // We send the data exactly as the frontend expects it
     res.json(result.rows);
   } catch (err) {
     console.error("Market Fetch Error:", err);
@@ -128,7 +135,7 @@ app.post('/api/markets', async (req, res) => {
   }
 });
 
-// --- 5. DEPOSIT (Test Environment) ---
+// --- 5. DEPOSIT ---
 app.post('/api/deposit', async (req, res) => {
   const { email, amount_kes } = req.body;
   try {
@@ -144,9 +151,10 @@ app.post('/api/deposit', async (req, res) => {
   }
 });
 
-// --- 6. PLACE A BET ---
+// --- 6. PLACE A TRADE (WITH THESIS) ---
 app.post('/api/bet', async (req, res) => {
-  const { email, market_id, chosen_option, amount_kes } = req.body;
+  // NEW: Accepting 'thesis' from the frontend
+  const { email, market_id, chosen_option, amount_kes, thesis } = req.body;
   const client = await pool.connect();
 
   try {
@@ -168,18 +176,26 @@ app.post('/api/bet', async (req, res) => {
       [user.id, market_id, chosen_option, amount_kes]
     );
 
+    // NEW: The "Skin in the Game" Thesis insertion!
+    if (thesis && thesis.trim() !== '' && amount_kes >= 50) {
+      await client.query(
+        'INSERT INTO theses (bet_id, user_id, market_id, content) VALUES ($1, $2, $3, $4)',
+        [betRes.rows[0].id, user.id, market_id, thesis.trim()]
+      );
+    }
+
     await client.query('COMMIT'); 
     res.json(betRes.rows[0]); 
   } catch (err) {
     await client.query('ROLLBACK'); 
-    console.error("Betting Error:", err);
+    console.error("Trading Error:", err);
     res.status(400).json({ message: err.message });
   } finally {
     client.release(); 
   }
 });
 
-// --- 7. GET A USER'S BET HISTORY (WITH ACTUAL PAYOUT MATH) ---
+// --- 7. GET A USER'S HISTORY ---
 app.get('/api/bets', async (req, res) => {
   const { email } = req.query;
   try {
@@ -194,7 +210,6 @@ app.get('/api/bets', async (req, res) => {
       ORDER BY b.placed_at DESC
     `, [email]);
 
-    // Calculate exact payouts for resolved markets!
     const betsWithPayouts = result.rows.map(bet => {
       const stake = parseFloat(bet.amount_kes);
       let totalPayout = 0;
@@ -203,7 +218,7 @@ app.get('/api/bets', async (req, res) => {
       if (bet.is_resolved) {
         if (bet.winning_option === 'Refunded') {
           status = 'Refunded';
-          totalPayout = stake; // Got exactly their money back
+          totalPayout = stake; 
         } else if (bet.chosen_option === bet.winning_option) {
           status = 'Won';
           const poolA = parseFloat(bet.option_a_pool || 0);
@@ -225,8 +240,8 @@ app.get('/api/bets', async (req, res) => {
 
       return {
         ...bet,
-        status, // 'Pending', 'Won', 'Lost', or 'Refunded'
-        payout_kes: totalPayout // Their exact winnings!
+        status, 
+        payout_kes: totalPayout 
       };
     });
 
@@ -240,21 +255,17 @@ app.get('/api/bets', async (req, res) => {
 app.post('/api/resolve', async (req, res) => {
   const { market_id, winning_option } = req.body;
   const client = await pool.connect();
-  
-  // The God-Mode wallet that collects the fees
-  const ADMIN_EMAIL = 'nguitui.kamau@strathmore.edu'; 
+  const ADMIN_EMAIL = 'nguitui.kamau@gmail.com'; // Updated your admin email
 
   try {
     await client.query('BEGIN');
     
-    // 1. Lock the market and fetch current stats
     const marketRes = await client.query('SELECT * FROM markets WHERE id = $1 FOR UPDATE', [market_id]);
     if (marketRes.rows.length === 0) throw new Error('Market not found.');
     const market = marketRes.rows[0];
 
     if (market.is_resolved) throw new Error('Market is already resolved.');
 
-    // 2. Safely figure out if 'A' or 'B' won based on admin input
     let winLetter = '';
     const inputOpt = winning_option.toLowerCase().trim();
     if (inputOpt === 'a' || inputOpt === market.option_a.toLowerCase().trim()) {
@@ -265,58 +276,35 @@ app.post('/api/resolve', async (req, res) => {
       throw new Error('Winning option matched neither A nor B.');
     }
 
-    // 3. Grab the live pool totals
     const poolA = parseFloat(market.option_a_pool || 0);
     const poolB = parseFloat(market.option_b_pool || 0);
     const totalPool = poolA + poolB;
 
-    // ==========================================
-    // RULE 1: THE UNANIMOUS BET (FULL REFUND)
-    // ==========================================
     if (poolA === 0 || poolB === 0) {
-      console.log(`\n--- REFUNDING UNANIMOUS MARKET ${market_id} ---`);
-      
       const allBets = await client.query('SELECT user_id, amount_kes FROM bets WHERE market_id = $1', [market_id]);
-      
-      // Give everyone their exact money back
       for (const bet of allBets.rows) {
         await client.query(
           'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE id = $2',
           [bet.amount_kes, bet.user_id]
         );
       }
-
-      // Mark market as cancelled so the UI knows what happened
       await client.query(
         "UPDATE markets SET is_resolved = TRUE, winning_option = 'Refunded', category = 'Cancelled (Refund)' WHERE id = $1", 
         [market_id]
       );
-
       await client.query('COMMIT');
       return res.json({ success: true, message: 'Unanimous market! Everyone has been fully refunded.' });
     }
 
-    // ==========================================
-    // RULE 2: NORMAL RESOLUTION & DYNAMIC FEE
-    // ==========================================
-    console.log(`\n--- RESOLVING MARKET ${market_id} ---`);
-    
     await client.query('UPDATE markets SET is_resolved = TRUE, winning_option = $1 WHERE id = $2', [winLetter, market_id]);
 
     const winningPool = winLetter === 'A' ? poolA : poolB;
     const losingPool = winLetter === 'A' ? poolB : poolA;
-
-    // If total pool < 1000 KES, fee is 0%. Otherwise, it is 5% (0.05).
     const HOUSE_FEE_PERCENTAGE = totalPool < 1000 ? 0 : 0.05;
     
-    // Calculate the math
     const houseCut = losingPool * HOUSE_FEE_PERCENTAGE;
     const distributableProfit = losingPool - houseCut;
 
-    console.log(`Total: ${totalPool} | WinPool: ${winningPool} | LosePool: ${losingPool}`);
-    console.log(`Fee: ${HOUSE_FEE_PERCENTAGE * 100}% | HouseCut: ${houseCut} KES | Profit to share: ${distributableProfit} KES`);
-
-    // Pay the House Admin Account (if there is a fee)
     if (houseCut > 0) {
       await client.query(
         'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE email = $2',
@@ -324,19 +312,15 @@ app.post('/api/resolve', async (req, res) => {
       );
     }
 
-    // Find the winning bets
     const winningBets = await client.query(
       'SELECT user_id, amount_kes FROM bets WHERE market_id = $1 AND chosen_option = $2',
       [market_id, winLetter]
     );
 
-    // Distribute original stake + proportional profit to the winners
     for (const bet of winningBets.rows) {
       const userStake = parseFloat(bet.amount_kes);
       const userSharePercentage = userStake / winningPool;
       const totalPayout = userStake + (userSharePercentage * distributableProfit);
-
-      console.log(`Paying User ID ${bet.user_id}: Stake ${userStake} -> Payout ${totalPayout}`);
 
       await client.query(
         'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE id = $2',
@@ -349,7 +333,6 @@ app.post('/api/resolve', async (req, res) => {
 
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error("Resolve Error:", err);
     res.status(400).json({ error: err.message });
   } finally {
     client.release();
@@ -379,7 +362,6 @@ app.get('/api/leaderboard', async (req, res) => {
     `;
     const result = await pool.query(query);
     
-    // Calculate the Win Rate percentage before sending it to React
     const leaderboard = result.rows.map((row) => {
       const resolved = parseInt(row.resolved_bets) || 0;
       const won = parseInt(row.won_bets) || 0;
@@ -388,7 +370,7 @@ app.get('/api/leaderboard', async (req, res) => {
       return {
         id: row.id.toString(),
         nickname: row.nickname,
-        email: row.email, // Passing email so we can securely identify the current user
+        email: row.email, 
         phoneNumber: row.phone_number,
         balance: parseFloat(row.balance),
         totalBets: parseInt(row.total_bets),
@@ -398,36 +380,6 @@ app.get('/api/leaderboard', async (req, res) => {
     });
 
     res.json(leaderboard);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- 11. DEMO WITHDRAW FUNDS ---
-app.post('/api/withdraw', async (req, res) => {
-  const { email, amount } = req.body;
-  try {
-    const withdrawAmount = parseFloat(amount);
-    if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
-      return res.status(400).json({ error: 'Invalid withdrawal amount' });
-    }
-
-    // 1. Check if they have enough money
-    const userRes = await pool.query('SELECT balance_kes FROM users WHERE email = $1', [email]);
-    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    
-    const currentBalance = parseFloat(userRes.rows[0].balance_kes);
-    if (currentBalance < withdrawAmount) {
-      return res.status(400).json({ error: 'Insufficient funds for withdrawal' });
-    }
-
-    // 2. Deduct the money from their balance
-    const updatedUser = await pool.query(
-      'UPDATE users SET balance_kes = balance_kes - $1 WHERE email = $2 RETURNING *',
-      [withdrawAmount, email]
-    );
-
-    res.json({ message: 'Withdrawal successful', user: updatedUser.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
