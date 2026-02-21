@@ -202,72 +202,113 @@ app.get('/api/bets', async (req, res) => {
 app.post('/api/resolve', async (req, res) => {
   const { market_id, winning_option } = req.body;
   const client = await pool.connect();
+  
+  // The God-Mode wallet that collects the fees
+  const ADMIN_EMAIL = 'nguitui.kamau@strathmore.edu'; 
 
   try {
     await client.query('BEGIN');
     
+    // 1. Lock the market and fetch current stats
     const marketRes = await client.query('SELECT * FROM markets WHERE id = $1 FOR UPDATE', [market_id]);
     if (marketRes.rows.length === 0) throw new Error('Market not found.');
     const market = marketRes.rows[0];
 
+    if (market.is_resolved) throw new Error('Market is already resolved.');
+
+    // 2. Safely figure out if 'A' or 'B' won based on admin input
     let winLetter = '';
-    let winName = '';
     const inputOpt = winning_option.toLowerCase().trim();
-    
     if (inputOpt === 'a' || inputOpt === market.option_a.toLowerCase().trim()) {
       winLetter = 'A';
-      winName = market.option_a;
     } else if (inputOpt === 'b' || inputOpt === market.option_b.toLowerCase().trim()) {
       winLetter = 'B';
-      winName = market.option_b;
     } else {
       throw new Error('Winning option matched neither A nor B.');
     }
 
-    await client.query('UPDATE markets SET is_resolved = TRUE, winning_option = $1 WHERE id = $2', [winLetter, market_id]);
+    // 3. Grab the live pool totals
+    const poolA = parseFloat(market.option_a_pool || 0);
+    const poolB = parseFloat(market.option_b_pool || 0);
+    const totalPool = poolA + poolB;
 
-    const allBetsRes = await client.query('SELECT * FROM bets WHERE market_id = $1', [market_id]);
-    
-    let absoluteTotalPool = 0;
-    let absoluteWinningPool = 0;
-    const winningBets = [];
-
-    for (const bet of allBetsRes.rows) {
-      const amt = parseFloat(bet.amount_kes);
-      absoluteTotalPool += amt;
+    // ==========================================
+    // RULE 1: THE UNANIMOUS BET (FULL REFUND)
+    // ==========================================
+    if (poolA === 0 || poolB === 0) {
+      console.log(`\n--- REFUNDING UNANIMOUS MARKET ${market_id} ---`);
       
-      const userPick = bet.chosen_option.toLowerCase().trim();
-      const safeWinLetter = winLetter.toLowerCase().trim();
-      const safeWinName = winName.toLowerCase().trim();
+      const allBets = await client.query('SELECT user_id, amount_kes FROM bets WHERE market_id = $1', [market_id]);
       
-      if (userPick === safeWinLetter || userPick === safeWinName) {
-        absoluteWinningPool += amt;
-        winningBets.push(bet);
-      }
-    }
-
-    console.log(`\n--- RESOLVING MARKET ${market_id} ---`);
-    console.log(`Total Pool: ${absoluteTotalPool} | Winning Pool: ${absoluteWinningPool}`);
-
-    if (absoluteWinningPool > 0) {
-      for (const bet of winningBets) {
-        const betAmount = parseFloat(bet.amount_kes);
-        const payout = (betAmount / absoluteWinningPool) * absoluteTotalPool;
-        
-        console.log(`Paying User ID ${bet.user_id}: Bet ${betAmount} -> Payout ${payout}`);
-        
+      // Give everyone their exact money back
+      for (const bet of allBets.rows) {
         await client.query(
-          'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE id = $2', 
-          [payout, bet.user_id]
+          'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE id = $2',
+          [bet.amount_kes, bet.user_id]
         );
       }
-      console.log(`--- PAYOUT COMPLETE ---\n`);
-    } else {
-      console.log(`--- NO WINNING BETS TO PAY OUT ---\n`);
+
+      // Mark market as cancelled so the UI knows what happened
+      await client.query(
+        "UPDATE markets SET is_resolved = TRUE, winning_option = 'Refunded', category = 'Cancelled (Refund)' WHERE id = $1", 
+        [market_id]
+      );
+
+      await client.query('COMMIT');
+      return res.json({ success: true, message: 'Unanimous market! Everyone has been fully refunded.' });
+    }
+
+    // ==========================================
+    // RULE 2: NORMAL RESOLUTION & DYNAMIC FEE
+    // ==========================================
+    console.log(`\n--- RESOLVING MARKET ${market_id} ---`);
+    
+    await client.query('UPDATE markets SET is_resolved = TRUE, winning_option = $1 WHERE id = $2', [winLetter, market_id]);
+
+    const winningPool = winLetter === 'A' ? poolA : poolB;
+    const losingPool = winLetter === 'A' ? poolB : poolA;
+
+    // If total pool < 1000 KES, fee is 0%. Otherwise, it is 5% (0.05).
+    const HOUSE_FEE_PERCENTAGE = totalPool < 1000 ? 0 : 0.05;
+    
+    // Calculate the math
+    const houseCut = losingPool * HOUSE_FEE_PERCENTAGE;
+    const distributableProfit = losingPool - houseCut;
+
+    console.log(`Total: ${totalPool} | WinPool: ${winningPool} | LosePool: ${losingPool}`);
+    console.log(`Fee: ${HOUSE_FEE_PERCENTAGE * 100}% | HouseCut: ${houseCut} KES | Profit to share: ${distributableProfit} KES`);
+
+    // Pay the House Admin Account (if there is a fee)
+    if (houseCut > 0) {
+      await client.query(
+        'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE email = $2',
+        [houseCut, ADMIN_EMAIL]
+      );
+    }
+
+    // Find the winning bets
+    const winningBets = await client.query(
+      'SELECT user_id, amount_kes FROM bets WHERE market_id = $1 AND chosen_option = $2',
+      [market_id, winLetter]
+    );
+
+    // Distribute original stake + proportional profit to the winners
+    for (const bet of winningBets.rows) {
+      const userStake = parseFloat(bet.amount_kes);
+      const userSharePercentage = userStake / winningPool;
+      const totalPayout = userStake + (userSharePercentage * distributableProfit);
+
+      console.log(`Paying User ID ${bet.user_id}: Stake ${userStake} -> Payout ${totalPayout}`);
+
+      await client.query(
+        'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE id = $2',
+        [totalPayout, bet.user_id]
+      );
     }
 
     await client.query('COMMIT');
-    res.json({ success: true, message: 'Market resolved!' });
+    res.json({ success: true, message: `Market resolved! House took ${houseCut} KES.` });
+
   } catch (err) {
     await client.query('ROLLBACK');
     console.error("Resolve Error:", err);
