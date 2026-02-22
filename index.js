@@ -452,6 +452,23 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
+// --- 10. GET THESES (THE DEBATE ARENA) ---
+app.get('/api/theses/:market_id', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT t.id, t.content, t.created_at, u.nickname, b.chosen_option, b.amount_kes
+      FROM theses t
+      JOIN users u ON t.user_id = u.id
+      JOIN bets b ON t.bet_id = b.id
+      WHERE t.market_id = $1
+      ORDER BY t.amount_kes DESC, t.created_at DESC -- Sorts by highest conviction (money) first!
+    `, [req.params.market_id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(port, () => {
   console.log(`🚀 UniStake Engine running at http://localhost:${port}`);
 });
