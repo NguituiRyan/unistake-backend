@@ -461,10 +461,11 @@ app.get('/api/theses/:market_id', async (req, res) => {
       JOIN users u ON t.user_id = u.id
       JOIN bets b ON t.bet_id = b.id
       WHERE t.market_id = $1
-      ORDER BY t.amount_kes DESC, t.created_at DESC -- Sorts by highest conviction (money) first!
+      ORDER BY b.amount_kes DESC, t.created_at DESC 
     `, [req.params.market_id]);
     res.json(result.rows);
   } catch (err) {
+    console.error("Theses Fetch Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
