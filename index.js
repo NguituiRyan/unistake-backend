@@ -189,16 +189,52 @@ app.get('/api/markets', async (req, res) => {
   }
 });
 
+// --- 4.5 CREATE A MARKET (USER-GENERATED WITH FEE) ---
 app.post('/api/markets', async (req, res) => {
-  const { title, option_a, option_b, category, end_date } = req.body;
+  const { email, title, option_a, option_b, category, end_date } = req.body;
+  const client = await pool.connect();
+  
+  const LISTING_FEE = 1000; // The cost to list a market
+
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    
+    // 1. Verify user and balance
+    const userRes = await client.query('SELECT id, balance_kes FROM users WHERE email = $1', [email]);
+    if (userRes.rows.length === 0) throw new Error('User not found.');
+    
+    const user = userRes.rows[0];
+    if (parseFloat(user.balance_kes) < LISTING_FEE) {
+      throw new Error(`Insufficient funds. You need KES ${LISTING_FEE} to list a market.`);
+    }
+
+    // 2. Deduct the Listing Fee from their wallet
+    await client.query(
+      'UPDATE users SET balance_kes = balance_kes - $1::numeric WHERE id = $2',
+      [LISTING_FEE, user.id]
+    );
+
+    // 3. Create the Market
+    const result = await client.query(
       'INSERT INTO markets (title, option_a, option_b, category, end_date) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [title, option_a, option_b, category, end_date]
     );
+
+    // Send the fee to the House/Admin Wallet (Optional, but good for your records!)
+    const ADMIN_EMAIL = 'nguitui.kamau@gmail.com';
+    await client.query(
+      'UPDATE users SET balance_kes = balance_kes + $1::numeric WHERE email = $2',
+      [LISTING_FEE, ADMIN_EMAIL]
+    );
+
+    await client.query('COMMIT');
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    await client.query('ROLLBACK');
+    console.error("Market Creation Error:", err);
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
