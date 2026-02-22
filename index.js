@@ -4,7 +4,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const { OAuth2Client } = require('google-auth-library');
 const bcrypt = require('bcrypt');
-
+const fetch = require('node-fetch');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -151,6 +151,26 @@ app.post('/api/markets', async (req, res) => {
     if (!user.is_admin) {
       if (parseFloat(user.balance_kes) < LISTING_FEE) throw new Error('Insufficient funds.');
       await client.query('UPDATE users SET balance_kes = balance_kes - $1 WHERE id = $2', [LISTING_FEE, user.id]);
+    }
+
+    // 🚨 SEND TELEGRAM ALERT TO ADMIN 🚨
+    if (!user.is_admin) {
+      const telegramMessage = `🚨 *New Market Pending!*\n\n👤 *Creator:* ${user.email}\n❓ *Question:* ${title}\n⚖️ *Options:* ${option_a} vs ${option_b}\n💰 *Escrow:* KES 200 collected.\n\nLog in to the Admin Dashboard to approve or reject.`;
+      
+      try {
+        await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: process.env.TELEGRAM_CHAT_ID,
+            text: telegramMessage,
+            parse_mode: 'Markdown'
+          })
+        });
+      } catch (telegramErr) {
+        console.error("Telegram alert failed:", telegramErr);
+        // We don't throw an error here because we still want the market creation to succeed even if Telegram is down!
+      }
     }
 
     const result = await client.query(
