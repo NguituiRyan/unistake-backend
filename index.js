@@ -4,7 +4,10 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const { OAuth2Client } = require('google-auth-library');
 const bcrypt = require('bcrypt');
-const fetch = require('node-fetch');
+
+// (Optional) Used for Telegram Bot notifications
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args)).catch(() => null);
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -19,13 +22,12 @@ const pool = new Pool({
 
 const ADMIN_EMAIL = 'nguitui.kamau@gmail.com';
 
-// Database Initialization
+// --- AUTO-DATABASE UPGRADE ON STARTUP ---
 pool.connect(async (err, client, release) => {
   if (err) return console.error('Error acquiring cloud client', err.stack);
   console.log('✅ Successfully connected to Neon Cloud Database!');
   
   try {
-    // Ensure the theses table exists
     await client.query(`
       CREATE TABLE IF NOT EXISTS theses (
         id SERIAL PRIMARY KEY,
@@ -36,7 +38,15 @@ pool.connect(async (err, client, release) => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    console.log('✅ Tables are verified!');
+    
+    // Auto-inject the new Creator/Approval columns without crashing
+    await client.query('ALTER TABLE markets ADD COLUMN IF NOT EXISTS creator_id INTEGER REFERENCES users(id);');
+    
+    // We set default TRUE for existing markets so your old ones don't vanish!
+    await client.query('ALTER TABLE markets ADD COLUMN IF NOT EXISTS is_approved BOOLEAN DEFAULT TRUE;');
+    await client.query('ALTER TABLE markets ADD COLUMN IF NOT EXISTS admin_notes TEXT;');
+
+    console.log('✅ Database Schema is fully up-to-date!');
   } catch (tableErr) {
     console.error('Error verifying tables:', tableErr);
   }
@@ -121,7 +131,6 @@ app.get('/api/balance/:email', async (req, res) => {
 // --- MARKETS & CREATION (WITH APPROVAL QUEUE) ---
 app.get('/api/markets', async (req, res) => {
   try {
-    // Only fetch markets that have been APPROVED by admin
     const result = await pool.query(`
       SELECT m.*, COALESCE(COUNT(DISTINCT b.user_id), 0) AS traders_count
       FROM markets m
@@ -153,30 +162,24 @@ app.post('/api/markets', async (req, res) => {
       await client.query('UPDATE users SET balance_kes = balance_kes - $1 WHERE id = $2', [LISTING_FEE, user.id]);
     }
 
-    // 🚨 SEND TELEGRAM ALERT TO ADMIN 🚨
-    if (!user.is_admin) {
-      const telegramMessage = `🚨 *New Market Pending!*\n\n👤 *Creator:* ${user.email}\n❓ *Question:* ${title}\n⚖️ *Options:* ${option_a} vs ${option_b}\n💰 *Escrow:* KES 200 collected.\n\nLog in to the Admin Dashboard to approve or reject.`;
-      
-      try {
-        await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: process.env.TELEGRAM_CHAT_ID,
-            text: telegramMessage,
-            parse_mode: 'Markdown'
-          })
-        });
-      } catch (telegramErr) {
-        console.error("Telegram alert failed:", telegramErr);
-        // We don't throw an error here because we still want the market creation to succeed even if Telegram is down!
-      }
-    }
-
     const result = await client.query(
       'INSERT INTO markets (title, option_a, option_b, category, end_date, creator_id, is_approved) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [title, option_a, option_b, category, end_date, user.id, user.is_admin] // Admin markets auto-approved
+      [title, option_a, option_b, category, end_date, user.id, user.is_admin] 
     );
+
+    // Telegram Bot Alert logic
+    if (!user.is_admin && process.env.TELEGRAM_BOT_TOKEN) {
+      const telegramMessage = `🚨 *New Market Pending!*\n\n👤 *Creator:* ${email}\n❓ *Question:* ${title}\n⚖️ *Options:* ${option_a} vs ${option_b}\n💰 *Escrow:* KES 200 collected.`;
+      try {
+        if (typeof fetch === 'function') {
+           await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text: telegramMessage, parse_mode: 'Markdown' })
+           });
+        }
+      } catch (e) { console.error("Telegram error:", e); }
+    }
 
     await client.query('COMMIT');
     res.json({ message: user.is_admin ? "Market created!" : "Market submitted for approval!", market: result.rows[0] });
@@ -207,7 +210,6 @@ app.post('/api/admin/approve-market', async (req, res) => {
             await client.query('UPDATE markets SET is_approved = TRUE WHERE id = $1', [market_id]);
         } else {
             const market = (await client.query('SELECT creator_id FROM markets WHERE id = $1', [market_id])).rows[0];
-            // Refund 200 KES
             await client.query('UPDATE users SET balance_kes = balance_kes + 200 WHERE id = $1', [market.creator_id]);
             await client.query('DELETE FROM markets WHERE id = $1', [market_id]);
         }
@@ -221,7 +223,7 @@ app.post('/api/admin/approve-market', async (req, res) => {
     }
 });
 
-// --- TRADING & RESOLUTION (WITH CREATOR ROYALTY) ---
+// --- TRADING & RESOLUTION ---
 app.post('/api/bet', async (req, res) => {
   const { email, market_id, chosen_option, amount_kes, thesis } = req.body;
   const client = await pool.connect();
@@ -254,6 +256,55 @@ app.post('/api/bet', async (req, res) => {
   }
 });
 
+// 🚨 RESTORED: GET A USER'S HISTORY 🚨
+app.get('/api/bets', async (req, res) => {
+  const { email } = req.query;
+  try {
+    const result = await pool.query(`
+      SELECT b.id, b.chosen_option, b.amount_kes, b.placed_at,
+             m.title, m.is_resolved, m.winning_option, m.option_a, m.option_b, 
+             m.option_a_pool, m.option_b_pool
+      FROM bets b
+      JOIN users u ON b.user_id = u.id
+      JOIN markets m ON b.market_id = m.id
+      WHERE u.email = $1
+      ORDER BY b.placed_at DESC
+    `, [email]);
+
+    const betsWithPayouts = result.rows.map(bet => {
+      const stake = parseFloat(bet.amount_kes);
+      let totalPayout = 0;
+      let status = 'Pending';
+
+      if (bet.is_resolved) {
+        if (bet.winning_option === 'Refunded') {
+          status = 'Refunded';
+          totalPayout = stake; 
+        } else if (bet.chosen_option === bet.winning_option) {
+          status = 'Won';
+          const poolA = parseFloat(bet.option_a_pool || 0);
+          const poolB = parseFloat(bet.option_b_pool || 0);
+          const totalPool = poolA + poolB;
+          const winningPool = bet.winning_option === 'A' ? poolA : poolB;
+          const losingPool = bet.winning_option === 'A' ? poolB : poolA;
+
+          const fee = totalPool < 1000 ? 0 : 0.05;
+          const distributableProfit = losingPool - (losingPool * fee);
+          const share = stake / winningPool;
+
+          totalPayout = stake + (share * distributableProfit);
+        } else {
+          status = 'Lost';
+        }
+      }
+      return { ...bet, status, payout_kes: totalPayout };
+    });
+    res.json(betsWithPayouts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/resolve', async (req, res) => {
   const { market_id, winning_option } = req.body;
   const client = await pool.connect();
@@ -269,7 +320,6 @@ app.post('/api/resolve', async (req, res) => {
     const totalPool = poolA + poolB;
 
     if (poolA === 0 || poolB === 0) {
-      // Refund Logic
       const allBets = await client.query('SELECT user_id, amount_kes FROM bets WHERE market_id = $1', [market_id]);
       for (const bet of allBets.rows) {
         await client.query('UPDATE users SET balance_kes = balance_kes + $1 WHERE id = $2', [bet.amount_kes, bet.user_id]);
@@ -280,16 +330,13 @@ app.post('/api/resolve', async (req, res) => {
       const losingPool = winLetter === 'A' ? poolB : poolA;
       const winningPool = winLetter === 'A' ? poolA : poolB;
 
-      // FEE CALCULATIONS (5% Total)
       const totalFee = totalPool < 1000 ? 0 : losingPool * 0.05;
       const creatorRoyalty = totalPool < 1000 ? 0 : losingPool * 0.005; // 0.5%
       const adminCut = totalFee - creatorRoyalty;
 
-      // Pay Creator
       if (creatorRoyalty > 0 && market.creator_id) {
         await client.query('UPDATE users SET balance_kes = balance_kes + $1 WHERE id = $2', [creatorRoyalty, market.creator_id]);
       }
-      // Pay Admin
       if (adminCut > 0) {
         await client.query('UPDATE users SET balance_kes = balance_kes + $1 WHERE email = $2', [adminCut, ADMIN_EMAIL]);
       }
@@ -320,7 +367,7 @@ app.get('/api/theses/:market_id', async (req, res) => {
 
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    const result = await pool.query(`SELECT u.id, u.nickname, u.email, u.balance_kes as balance, COUNT(b.id) as total_bets, COUNT(CASE WHEN m.is_resolved = TRUE AND b.chosen_option = m.winning_option THEN 1 END) as won_bets, COUNT(CASE WHEN m.is_resolved = TRUE THEN 1 END) as resolved_bets FROM users u LEFT JOIN bets b ON u.id = b.user_id LEFT JOIN markets m ON b.market_id = m.id WHERE u.nickname IS NOT NULL GROUP BY u.id ORDER BY won_bets DESC, balance DESC LIMIT 100`);
+    const result = await pool.query(`SELECT u.id, u.nickname, u.email, u.balance_kes as balance, COUNT(b.id) as total_bets, COUNT(CASE WHEN m.is_resolved = TRUE AND b.chosen_option = m.winning_option THEN 1 END) as won_bets, COUNT(CASE WHEN m.is_resolved = TRUE THEN 1 END) as resolved_bets FROM users u LEFT JOIN bets b ON u.id = b.user_id LEFT JOIN markets m ON b.market_id = m.id WHERE u.nickname IS NOT NULL GROUP BY u.id, u.nickname, u.email, u.balance_kes ORDER BY won_bets DESC, balance DESC LIMIT 100`);
     res.json(result.rows.map(r => ({ ...r, winRate: r.resolved_bets > 0 ? Math.round((r.won_bets/r.resolved_bets)*100) : 0 })));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
