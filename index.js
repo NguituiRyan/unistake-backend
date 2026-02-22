@@ -194,7 +194,7 @@ app.post('/api/markets', async (req, res) => {
   const { email, title, option_a, option_b, category, end_date } = req.body;
   const client = await pool.connect();
   
-  const LISTING_FEE = 1000; // The cost to list a market
+  const LISTING_FEE = 200; // The cost to list a market
 
   try {
     await client.query('BEGIN');
